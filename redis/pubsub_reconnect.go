@@ -16,9 +16,22 @@ package redis
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
+
+// BlockingCmd represents a blocking Redis command that should be automatically
+// re-issued after a reconnection. It stores the command name and arguments
+// so they can be replayed on a new connection.
+type BlockingCmd struct {
+	// Cmd is the Redis command name (e.g., "BLPOP", "BRPOP", "BRPOPLPUSH").
+	Cmd string
+
+	// Args are the command arguments excluding the command name itself.
+	// For BLPOP "mylist" 0, Args would be []interface{}{"mylist", 0}.
+	Args []interface{}
+}
 
 // AutoReconnectPubSub wraps a PubSubConn with automatic reconnection support.
 // When the connection is lost, it will automatically reconnect and re-subscribe
@@ -26,42 +39,28 @@ import (
 //
 // # Reconnection and blocking commands
 //
-// AutoReconnectPubSub only restores SUBSCRIBE and PSUBSCRIBE state after a
-// reconnection. Blocking commands such as BLPOP, BRPOP, and BRPOPLPUSH are
-// NOT automatically re-issued because they require application-level logic to
-// determine the correct timeout and key list.
+// AutoReconnectPubSub automatically restores SUBSCRIBE and PSUBSCRIBE state
+// after a reconnection. For blocking commands such as BLPOP, BRPOP, and
+// BRPOPLPUSH, you have two options:
 //
-// Use the OnReconnect callback to re-issue blocking commands or perform other
-// application-specific recovery after a successful reconnection:
+//  1. Use AddBlockingCmd() to register commands that should be automatically
+//     re-issued after each successful reconnection. This is the recommended
+//     approach for most use cases.
 //
-//	psc := redis.NewAutoReconnectPubSub(dialFn)
-//	psc.OnReconnect = func(conn redis.Conn) {
-//	    // Re-issue blocking commands on the new connection
-//	    conn.Send("BLPOP", "mylist", 0)
-//	    conn.Flush()
-//	}
+//  2. Use the OnReconnect callback for full control over the reconnection
+//     process. Use this for more complex recovery logic.
 //
-// Example usage:
+// Example:
 //
-//	dialFn := func() (redis.Conn, error) {
-//	    return redis.Dial("tcp", ":6379")
-//	}
 //	psc := redis.NewAutoReconnectPubSub(dialFn)
 //	defer psc.Close()
 //
-//	psc.Subscribe("channel1", "channel2")
-//	psc.PSubscribe("pattern.*")
+//	// Register blocking commands to auto-restore after reconnection
+//	psc.AddBlockingCmd("BLPOP", "work_queue", 0)
+//	psc.AddBlockingCmd("BRPOP", "high_priority_queue", 60)
 //
-//	for {
-//	    switch v := psc.Receive().(type) {
-//	    case redis.Message:
-//	        fmt.Printf("Message: %s from %s\n", v.Data, v.Channel)
-//	    case redis.Subscription:
-//	        fmt.Printf("Subscription: %s %s\n", v.Kind, v.Channel)
-//	    case error:
-//	        fmt.Printf("Error (will reconnect): %v\n", v)
-//	    }
-//	}
+//	// Subscribe to channels (auto-restored)
+//	psc.Subscribe("notifications")
 type AutoReconnectPubSub struct {
 	dialFn      func() (Conn, error)
 	dialCtxFn   func(ctx context.Context) (Conn, error)
@@ -69,16 +68,18 @@ type AutoReconnectPubSub struct {
 	psc         PubSubConn
 	channels    map[string]struct{}
 	patterns    map[string]struct{}
+	blockingCmds []BlockingCmd
 	reconnect   bool
 	maxAttempts int
 	backoff     time.Duration
 
 	// OnReconnect is an optional callback invoked after a successful reconnection.
 	// It is called with the newly established connection after all previously
-	// subscribed channels and patterns have been re-subscribed.
+	// subscribed channels, patterns, and registered blocking commands have
+	// been restored.
 	//
-	// Use this callback to re-issue blocking commands (BLPOP, BRPOP, etc.)
-	// or perform any other application-specific recovery on the new connection.
+	// Use this callback for application-specific recovery logic beyond what
+	// AddBlockingCmd provides.
 	//
 	// The callback is invoked while holding the internal mutex, so it must NOT
 	// call methods on the AutoReconnectPubSub itself (which would deadlock).
@@ -92,6 +93,7 @@ func NewAutoReconnectPubSub(dialFn func() (Conn, error)) *AutoReconnectPubSub {
 		dialFn:      dialFn,
 		channels:    make(map[string]struct{}),
 		patterns:    make(map[string]struct{}),
+		blockingCmds: make([]BlockingCmd, 0),
 		reconnect:   true,
 		maxAttempts: 5,
 		backoff:     100 * time.Millisecond,
@@ -104,6 +106,7 @@ func NewAutoReconnectPubSubContext(dialCtxFn func(ctx context.Context) (Conn, er
 		dialCtxFn:   dialCtxFn,
 		channels:    make(map[string]struct{}),
 		patterns:    make(map[string]struct{}),
+		blockingCmds: make([]BlockingCmd, 0),
 		reconnect:   true,
 		maxAttempts: 5,
 		backoff:     100 * time.Millisecond,
@@ -130,6 +133,57 @@ func (arpc *AutoReconnectPubSub) SetBackoff(d time.Duration) {
 	arpc.mu.Lock()
 	arpc.backoff = d
 	arpc.mu.Unlock()
+}
+
+// AddBlockingCmd registers a blocking command to be automatically re-issued
+// after each successful reconnection. The command is issued on the new
+// connection after SUBSCRIBE/PSUBSCRIBE state has been restored, but before
+// the OnReconnect callback (if any) is invoked.
+//
+// Commands are issued in the order they were added. If any command fails,
+// the reconnection attempt is considered failed and the connection is closed.
+//
+// Example:
+//
+//	psc.AddBlockingCmd("BLPOP", "work_queue", 0)
+//	psc.AddBlockingCmd("BRPOP", "high_priority", 30)
+func (arpc *AutoReconnectPubSub) AddBlockingCmd(cmd string, args ...interface{}) {
+	arpc.mu.Lock()
+	defer arpc.mu.Unlock()
+	arpc.blockingCmds = append(arpc.blockingCmds, BlockingCmd{Cmd: cmd, Args: args})
+}
+
+// RemoveBlockingCmd removes all registered blocking commands matching the given
+// command name. If no command name is provided, all blocking commands are removed.
+func (arpc *AutoReconnectPubSub) RemoveBlockingCmd(cmdName ...string) {
+	arpc.mu.Lock()
+	defer arpc.mu.Unlock()
+
+	if len(cmdName) == 0 {
+		arpc.blockingCmds = make([]BlockingCmd, 0)
+		return
+	}
+
+	keep := make([]BlockingCmd, 0, len(arpc.blockingCmds))
+	removeSet := make(map[string]struct{}, len(cmdName))
+	for _, name := range cmdName {
+		removeSet[name] = struct{}{}
+	}
+	for _, cmd := range arpc.blockingCmds {
+		if _, remove := removeSet[cmd.Cmd]; !remove {
+			keep = append(keep, cmd)
+		}
+	}
+	arpc.blockingCmds = keep
+}
+
+// BlockingCmds returns a copy of the currently registered blocking commands.
+func (arpc *AutoReconnectPubSub) BlockingCmds() []BlockingCmd {
+	arpc.mu.Lock()
+	defer arpc.mu.Unlock()
+	result := make([]BlockingCmd, len(arpc.blockingCmds))
+	copy(result, arpc.blockingCmds)
+	return result
 }
 
 func (arpc *AutoReconnectPubSub) connect() (Conn, error) {
@@ -170,6 +224,16 @@ func (arpc *AutoReconnectPubSub) ensureConn() error {
 			conn.Close()
 			arpc.psc = PubSubConn{}
 			return err
+		}
+	}
+
+	for _, bc := range arpc.blockingCmds {
+		args := make([]interface{}, len(bc.Args))
+		copy(args, bc.Args)
+		if _, err := conn.Do(bc.Cmd, args...); err != nil {
+			conn.Close()
+			arpc.psc = PubSubConn{}
+			return fmt.Errorf("redigo: auto-reconnect failed to re-issue blocking command %s: %w", bc.Cmd, err)
 		}
 	}
 

@@ -20,6 +20,7 @@ import (
 	"crypto/rand"
 	"crypto/sha1"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"sync"
@@ -165,12 +166,17 @@ type Pool struct {
 	// in the pool before being closed. Unlike IdleTimeout which only prunes
 	// connections from the back of the idle list when Get() is called,
 	// MaxIdleTimeout is applied to any idle connection being considered for use.
-	// If the value is zero, this check is not performed.
 	//
-	// The value must be a valid time.Duration (e.g. 30*time.Second, 5*time.Minute).
-	// Values less than time.Second are treated as zero (disabled) to prevent
-	// accidental misconfiguration where a bare integer like 30 would be
-	// interpreted as 30 nanoseconds instead of the intended 30 seconds.
+	// The zero value (default) disables this check. Explicitly set to a positive
+	// duration (e.g. 30*time.Second, 5*time.Minute) to enable it.
+	//
+	// WARNING: Do not use a bare integer value like 30, as time.Duration is in
+	// nanoseconds and 30 would mean 30 nanoseconds. Use time.Second, time.Minute,
+	// etc. Values less than time.Second are treated as zero (disabled) to prevent
+	// accidental misconfiguration.
+	//
+	// Use the Validate() method after setting Pool fields to detect invalid
+	// configuration before the pool is used.
 	MaxIdleTimeout time.Duration
 
 	// If Wait is true and the pool is at the MaxActive limit, then Get() waits
@@ -429,6 +435,40 @@ func (p *Pool) dial(ctx context.Context) (Conn, error) {
 		return p.Dial()
 	}
 	return nil, errors.New("redigo: must pass Dial or DialContext to pool")
+}
+
+// Validate checks the pool configuration for invalid or potentially
+// problematic values. It returns an error if any configuration issues
+// are detected.
+//
+// It is recommended to call Validate() after configuring the Pool but
+// before first use to catch misconfigurations early.
+func (p *Pool) Validate() error {
+	if p.Dial == nil && p.DialContext == nil {
+		return errors.New("redigo: Pool.Dial or Pool.DialContext must be set")
+	}
+	if p.MaxIdle < 0 {
+		return errors.New("redigo: Pool.MaxIdle must not be negative")
+	}
+	if p.MaxActive < 0 {
+		return errors.New("redigo: Pool.MaxActive must not be negative")
+	}
+	if p.IdleTimeout < 0 {
+		return errors.New("redigo: Pool.IdleTimeout must not be negative")
+	}
+	if p.MaxConnLifetime < 0 {
+		return errors.New("redigo: Pool.MaxConnLifetime must not be negative")
+	}
+	if p.MaxIdleTimeout < 0 {
+		return errors.New("redigo: Pool.MaxIdleTimeout must not be negative")
+	}
+	if p.MaxIdleTimeout > 0 && p.MaxIdleTimeout < time.Second {
+		return fmt.Errorf(
+			"redigo: Pool.MaxIdleTimeout is %v, which is less than 1 second; "+
+				"time.Duration is in nanoseconds, so use 30*time.Second instead of 30",
+			p.MaxIdleTimeout)
+	}
+	return nil
 }
 
 func (p *Pool) effectiveMaxIdleTimeout() time.Duration {

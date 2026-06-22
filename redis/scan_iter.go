@@ -34,9 +34,16 @@ var ErrNoMoreItems = errors.New("redigo: scan iteration round complete")
 //
 // # Concurrency
 //
-// A ScanIterator is NOT safe for concurrent use. Callers must synchronize
-// access externally if sharing across goroutines. Calling Next from multiple
-// goroutines without external synchronization results in undefined behavior.
+// A ScanIterator uses internal locking to protect state. The Done() method may
+// be called concurrently with Next() without blocking, as the lock is released
+// during network calls.
+//
+// However, calling Next() from multiple goroutines concurrently is not
+// recommended. While it will not cause memory corruption (the mutex ensures
+// safety), the iterator state (cursor, batch position) is shared and will be
+// advanced by whichever goroutine acquires the lock first. This leads to
+// interleaved and non-deterministic results for each caller. Use external
+// synchronization if multiple goroutines need to share one iterator.
 //
 // # Iteration Semantics
 //
@@ -135,56 +142,52 @@ func NewZScanIteratorContext(c Conn, ctx context.Context, key string, args ...in
 	return newScanIterator(c, ctx, "ZSCAN", []interface{}{key}, args...)
 }
 
-func (it *ScanIterator) execute() error {
-	var reply interface{}
-	var err error
-
+// execute performs a single SCAN call with the given cursor. It releases the lock
+// during the network call to avoid blocking other goroutines. It returns the
+// next cursor value, the batch of results, and any error.
+func (it *ScanIterator) execute(cursor int64) (nextCursor int64, batch []interface{}, err error) {
 	args := make([]interface{}, 0, len(it.prefix)+1+len(it.args))
 	args = append(args, it.prefix...)
-	args = append(args, it.cursor)
+	args = append(args, cursor)
 	args = append(args, it.args...)
 
+	var reply interface{}
 	if it.withCtx {
 		cwc, ok := it.c.(ConnWithContext)
 		if !ok {
-			return errContextNotSupported
+			return 0, nil, errContextNotSupported
 		}
 		reply, err = cwc.DoContext(it.ctx, it.cmd, args...)
 	} else {
 		reply, err = it.c.Do(it.cmd, args...)
 	}
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 
 	results, err := Values(reply, nil)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 	if len(results) != 2 {
-		return errors.New("redigo: unexpected scan reply length")
+		return 0, nil, errors.New("redigo: unexpected scan reply length")
 	}
 
 	cursorBytes, ok := results[0].([]byte)
 	if !ok {
-		return errors.New("redigo: unexpected scan cursor type")
+		return 0, nil, errors.New("redigo: unexpected scan cursor type")
 	}
-	it.cursor, err = strconv.ParseInt(string(cursorBytes), 10, 64)
+	nextCursor, err = strconv.ParseInt(string(cursorBytes), 10, 64)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 
-	it.batch, err = Values(results[1], nil)
+	batch, err = Values(results[1], nil)
 	if err != nil {
-		return err
-	}
-	it.idx = 0
-
-	if it.cursor == 0 {
-		it.done = true
+		return 0, nil, err
 	}
 
-	return nil
+	return nextCursor, batch, nil
 }
 
 // Next returns the next batch of results from the scan. It issues SCAN commands
@@ -195,15 +198,20 @@ func (it *ScanIterator) execute() error {
 // Next again after receiving ErrNoMoreItems to start a fresh iteration round,
 // which is useful when elements may have been added during the previous round.
 //
-// This method is NOT safe for concurrent use.
+// # Concurrency
+//
+// The mutex is held only while accessing and modifying iterator state. It is
+// released during network calls to avoid blocking other goroutines. However,
+// ScanIterator is still not safe for concurrent calls to Next() because each
+// call advances the cursor state. Multiple goroutines should not call Next()
+// concurrently without external synchronization.
 func (it *ScanIterator) Next() ([]interface{}, error) {
-	it.mu.Lock()
-	defer it.mu.Unlock()
-
 	for {
+		it.mu.Lock()
 		if it.idx < len(it.batch) {
 			results := it.batch[it.idx:]
 			it.idx = len(it.batch)
+			it.mu.Unlock()
 			return results, nil
 		}
 
@@ -212,12 +220,26 @@ func (it *ScanIterator) Next() ([]interface{}, error) {
 			it.cursor = 0
 			it.batch = nil
 			it.idx = 0
+			it.mu.Unlock()
 			return nil, ErrNoMoreItems
 		}
 
-		if err := it.execute(); err != nil {
+		cursor := it.cursor
+		it.mu.Unlock()
+
+		nextCursor, batch, err := it.execute(cursor)
+		if err != nil {
 			return nil, err
 		}
+
+		it.mu.Lock()
+		it.cursor = nextCursor
+		it.batch = batch
+		it.idx = 0
+		if nextCursor == 0 {
+			it.done = true
+		}
+		it.mu.Unlock()
 	}
 }
 
