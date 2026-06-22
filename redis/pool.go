@@ -27,8 +27,10 @@ import (
 )
 
 var (
-	_ ConnWithTimeout = (*activeConn)(nil)
-	_ ConnWithTimeout = (*errorConn)(nil)
+	_ ConnWithTimeout    = (*activeConn)(nil)
+	_ ConnWithTimeout    = (*errorConn)(nil)
+	_ ConnWithPipelineLen = (*activeConn)(nil)
+	_ ConnWithPipelineLen = (*errorConn)(nil)
 )
 
 var nowFunc = time.Now // for testing
@@ -159,6 +161,13 @@ type Pool struct {
 	// the timeout to a value less than the server's timeout.
 	IdleTimeout time.Duration
 
+	// MaxIdleTimeout is the maximum amount of time a connection can remain idle
+	// in the pool before being closed. Unlike IdleTimeout which only prunes
+	// connections from the back of the idle list when Get() is called,
+	// MaxIdleTimeout is applied to any idle connection being considered for use.
+	// If the value is zero, this check is not performed.
+	MaxIdleTimeout time.Duration
+
 	// If Wait is true and the pool is at the MaxActive limit, then Get() waits
 	// for a connection to be returned to the pool before returning.
 	Wait bool
@@ -218,10 +227,15 @@ func (p *Pool) GetContext(ctx context.Context) (Conn, error) {
 	}
 
 	// Prune stale connections at the back of the idle list.
-	if p.IdleTimeout > 0 {
+	if p.IdleTimeout > 0 || p.MaxIdleTimeout > 0 {
 		n := p.idle.count
-		for i := 0; i < n && p.idle.back != nil && p.idle.back.t.Add(p.IdleTimeout).Before(nowFunc()); i++ {
+		for i := 0; i < n && p.idle.back != nil; i++ {
 			pc := p.idle.back
+			idleExpired := p.IdleTimeout > 0 && pc.t.Add(p.IdleTimeout).Before(nowFunc())
+			maxIdleExpired := p.MaxIdleTimeout > 0 && pc.t.Add(p.MaxIdleTimeout).Before(nowFunc())
+			if !idleExpired && !maxIdleExpired {
+				break
+			}
 			p.idle.popBack()
 			p.mu.Unlock()
 			pc.c.Close()
@@ -235,7 +249,9 @@ func (p *Pool) GetContext(ctx context.Context) (Conn, error) {
 		pc := p.idle.front
 		p.idle.popFront()
 		p.mu.Unlock()
-		if (p.TestOnBorrow == nil || p.TestOnBorrow(pc.c, pc.t) == nil) &&
+		maxIdleExpired := p.MaxIdleTimeout > 0 && pc.t.Add(p.MaxIdleTimeout).Before(nowFunc())
+		if !maxIdleExpired &&
+			(p.TestOnBorrow == nil || p.TestOnBorrow(pc.c, pc.t) == nil) &&
 			(p.TestOnBorrowContext == nil || p.TestOnBorrowContext(ctx, pc.c, pc.t) == nil) &&
 			(p.MaxConnLifetime == 0 || nowFunc().Sub(pc.created) < p.MaxConnLifetime) {
 			return &activeConn{p: p, pc: pc}, nil
@@ -610,6 +626,18 @@ func (ac *activeConn) ReceiveWithTimeout(timeout time.Duration) (reply interface
 	return cwt.ReceiveWithTimeout(timeout)
 }
 
+func (ac *activeConn) PipelineLen() int {
+	pc := ac.pc
+	if pc == nil {
+		return 0
+	}
+	cwl, ok := pc.c.(ConnWithPipelineLen)
+	if !ok {
+		return -1
+	}
+	return cwl.PipelineLen()
+}
+
 type errorConn struct{ err error }
 
 func (ec errorConn) Do(string, ...interface{}) (interface{}, error) { return nil, ec.err }
@@ -626,6 +654,7 @@ func (ec errorConn) Flush() error                                          { ret
 func (ec errorConn) Receive() (interface{}, error)                         { return nil, ec.err }
 func (ec errorConn) ReceiveContext(context.Context) (interface{}, error)   { return nil, ec.err }
 func (ec errorConn) ReceiveWithTimeout(time.Duration) (interface{}, error) { return nil, ec.err }
+func (ec errorConn) PipelineLen() int                                      { return 0 }
 
 type idleList struct {
 	count       int

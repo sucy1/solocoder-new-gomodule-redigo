@@ -866,3 +866,13 @@ func (c *conn) DoWithTimeout(readTimeout time.Duration, cmd string, args ...inte
 	}
 	return reply, err
 }
+
+// PipelineLen returns the number of commands that have been sent to the connection's
+// output buffer using the Send method but have not yet been flushed and received.
+// This is useful for tracking the size of a pipeline.
+func (c *conn) PipelineLen() int {
+	c.mu.Lock()
+	n := c.pending
+	c.mu.Unlock()
+	return n
+}

@@ -116,6 +116,18 @@ type ConnWithContext interface {
 
 var errTimeoutNotSupported = errors.New("redis: connection does not support ConnWithTimeout")
 var errContextNotSupported = errors.New("redis: connection does not support ConnWithContext")
+var errPipelineLenNotSupported = errors.New("redis: connection does not support ConnWithPipelineLen")
+
+// ConnWithPipelineLen is an optional interface that allows the caller to get
+// the number of pending commands in the pipeline.
+type ConnWithPipelineLen interface {
+	Conn
+
+	// PipelineLen returns the number of commands that have been sent to the
+	// connection's output buffer using the Send method but have not yet been
+	// flushed and received.
+	PipelineLen() int
+}
 
 // DoContext sends a command to server and returns the received reply.
 // min(ctx,DialReadTimeout()) will be used as the deadline.
@@ -165,6 +177,53 @@ func ReceiveWithTimeout(c Conn, timeout time.Duration) (interface{}, error) {
 		return nil, errTimeoutNotSupported
 	}
 	return cwt.ReceiveWithTimeout(timeout)
+}
+
+// PipelineLen returns the number of commands that have been sent to the
+// connection's output buffer using the Send method but have not yet been
+// flushed and received. If the connection does not satisfy the
+// ConnWithPipelineLen interface, then -1 is returned.
+func PipelineLen(c Conn) int {
+	cwl, ok := c.(ConnWithPipelineLen)
+	if !ok {
+		return -1
+	}
+	return cwl.PipelineLen()
+}
+
+// BgSave executes the Redis BGSAVE command, which asynchronously saves the
+// dataset to disk. It returns the status string from the server.
+//
+// Equivalent to: String(c.Do("BGSAVE"))
+func BgSave(c Conn) (string, error) {
+	return String(c.Do("BGSAVE"))
+}
+
+// BgSaveContext executes the Redis BGSAVE command with context support.
+func BgSaveContext(c Conn, ctx context.Context) (string, error) {
+	cwc, ok := c.(ConnWithContext)
+	if !ok {
+		return "", errContextNotSupported
+	}
+	return String(cwc.DoContext(ctx, "BGSAVE"))
+}
+
+// BgRewriteAOF executes the Redis BGREWRITEAOF command, which asynchronously
+// rewrites the append-only file to reflect the current dataset.
+// It returns the status string from the server.
+//
+// Equivalent to: String(c.Do("BGREWRITEAOF"))
+func BgRewriteAOF(c Conn) (string, error) {
+	return String(c.Do("BGREWRITEAOF"))
+}
+
+// BgRewriteAOFContext executes the Redis BGREWRITEAOF command with context support.
+func BgRewriteAOFContext(c Conn, ctx context.Context) (string, error) {
+	cwc, ok := c.(ConnWithContext)
+	if !ok {
+		return "", errContextNotSupported
+	}
+	return String(cwc.DoContext(ctx, "BGREWRITEAOF"))
 }
 
 // SlowLog represents a redis SlowLog
