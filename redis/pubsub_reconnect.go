@@ -24,6 +24,23 @@ import (
 // When the connection is lost, it will automatically reconnect and re-subscribe
 // to all previously subscribed channels and patterns.
 //
+// # Reconnection and blocking commands
+//
+// AutoReconnectPubSub only restores SUBSCRIBE and PSUBSCRIBE state after a
+// reconnection. Blocking commands such as BLPOP, BRPOP, and BRPOPLPUSH are
+// NOT automatically re-issued because they require application-level logic to
+// determine the correct timeout and key list.
+//
+// Use the OnReconnect callback to re-issue blocking commands or perform other
+// application-specific recovery after a successful reconnection:
+//
+//	psc := redis.NewAutoReconnectPubSub(dialFn)
+//	psc.OnReconnect = func(conn redis.Conn) {
+//	    // Re-issue blocking commands on the new connection
+//	    conn.Send("BLPOP", "mylist", 0)
+//	    conn.Flush()
+//	}
+//
 // Example usage:
 //
 //	dialFn := func() (redis.Conn, error) {
@@ -42,10 +59,7 @@ import (
 //	    case redis.Subscription:
 //	        fmt.Printf("Subscription: %s %s\n", v.Kind, v.Channel)
 //	    case error:
-//	        // The AutoReconnectPubSub will try to reconnect, but the error
-//	        // is still surfaced here so the application can handle it.
 //	        fmt.Printf("Error (will reconnect): %v\n", v)
-//	        time.Sleep(time.Second)
 //	    }
 //	}
 type AutoReconnectPubSub struct {
@@ -58,6 +72,18 @@ type AutoReconnectPubSub struct {
 	reconnect   bool
 	maxAttempts int
 	backoff     time.Duration
+
+	// OnReconnect is an optional callback invoked after a successful reconnection.
+	// It is called with the newly established connection after all previously
+	// subscribed channels and patterns have been re-subscribed.
+	//
+	// Use this callback to re-issue blocking commands (BLPOP, BRPOP, etc.)
+	// or perform any other application-specific recovery on the new connection.
+	//
+	// The callback is invoked while holding the internal mutex, so it must NOT
+	// call methods on the AutoReconnectPubSub itself (which would deadlock).
+	// It should only use the provided Conn argument directly.
+	OnReconnect func(conn Conn)
 }
 
 // NewAutoReconnectPubSub creates a new AutoReconnectPubSub using the given dial function.
@@ -147,6 +173,10 @@ func (arpc *AutoReconnectPubSub) ensureConn() error {
 		}
 	}
 
+	if arpc.OnReconnect != nil {
+		arpc.OnReconnect(conn)
+	}
+
 	return nil
 }
 
@@ -155,7 +185,10 @@ func (arpc *AutoReconnectPubSub) tryReconnect() error {
 	defer arpc.mu.Unlock()
 
 	if !arpc.reconnect {
-		return arpc.psc.Conn.Err()
+		if arpc.psc.Conn != nil {
+			return arpc.psc.Conn.Err()
+		}
+		return nil
 	}
 
 	if arpc.psc.Conn != nil {
@@ -306,14 +339,12 @@ func (arpc *AutoReconnectPubSub) Receive() interface{} {
 		_ = arpc.tryReconnect()
 		return err
 	}
-	conn := arpc.psc.Conn
 	arpc.mu.Unlock()
 
 	reply := arpc.psc.Receive()
 	if _, ok := reply.(error); ok {
 		_ = arpc.tryReconnect()
 	}
-	_ = conn
 	return reply
 }
 

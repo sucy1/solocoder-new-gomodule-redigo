@@ -18,13 +18,38 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync"
 )
 
-// ErrNoMoreItems is returned by ScanIterator.Next when there are no more items to scan.
-var ErrNoMoreItems = errors.New("redigo: no more items to scan")
+// ErrNoMoreItems is returned by ScanIterator.Next when a full iteration
+// round is complete (the server returned cursor 0). The caller can start
+// a new iteration round by calling Next again, which will issue a fresh
+// SCAN starting from cursor 0.
+var ErrNoMoreItems = errors.New("redigo: scan iteration round complete")
 
-// ScanIterator provides an iterator interface for Redis SCAN, SSCAN, HSCAN, and ZSCAN commands.
-// It automatically handles the cursor pagination until all results are returned without blocking.
+// ScanIterator provides an iterator interface for Redis SCAN, SSCAN, HSCAN,
+// and ZSCAN commands. It automatically handles cursor pagination until the
+// server returns cursor 0, which signals the end of one complete iteration
+// round over the collection.
+//
+// # Concurrency
+//
+// A ScanIterator is NOT safe for concurrent use. Callers must synchronize
+// access externally if sharing across goroutines. Calling Next from multiple
+// goroutines without external synchronization results in undefined behavior.
+//
+// # Iteration Semantics
+//
+// Redis SCAN is a cursor-based iteration with the following guarantees:
+//   - A full iteration returns all elements that were present in the collection
+//     from start to end, but may also return duplicates or miss elements that
+//     were added or deleted during the iteration.
+//   - When the server returns cursor 0, one complete round is finished. This
+//     does NOT mean the collection is empty; it means the server has visited
+//     every slot in its internal hash table at least once.
+//   - If elements are added during iteration, they may or may not be returned.
+//     To capture all new elements, start a new iteration round after receiving
+//     ErrNoMoreItems.
 //
 // Example usage:
 //
@@ -42,6 +67,7 @@ var ErrNoMoreItems = errors.New("redigo: no more items to scan")
 //	    }
 //	}
 type ScanIterator struct {
+	mu      sync.Mutex
 	c       Conn
 	ctx     context.Context
 	cmd     string
@@ -161,9 +187,19 @@ func (it *ScanIterator) execute() error {
 	return nil
 }
 
-// Next returns the next batch of results from the scan.
-// When there are no more results, it returns nil, ErrNoMoreItems.
+// Next returns the next batch of results from the scan. It issues SCAN commands
+// to the server as needed to fill each batch.
+//
+// When the server signals that one complete iteration round is finished by
+// returning cursor 0, Next returns ErrNoMoreItems. The caller can call
+// Next again after receiving ErrNoMoreItems to start a fresh iteration round,
+// which is useful when elements may have been added during the previous round.
+//
+// This method is NOT safe for concurrent use.
 func (it *ScanIterator) Next() ([]interface{}, error) {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+
 	for {
 		if it.idx < len(it.batch) {
 			results := it.batch[it.idx:]
@@ -172,6 +208,10 @@ func (it *ScanIterator) Next() ([]interface{}, error) {
 		}
 
 		if it.done {
+			it.done = false
+			it.cursor = 0
+			it.batch = nil
+			it.idx = 0
 			return nil, ErrNoMoreItems
 		}
 
@@ -179,4 +219,13 @@ func (it *ScanIterator) Next() ([]interface{}, error) {
 			return nil, err
 		}
 	}
+}
+
+// Done returns true if the current iteration round is complete (the server
+// returned cursor 0) and all buffered items have been consumed. A new round
+// can be started by calling Next again.
+func (it *ScanIterator) Done() bool {
+	it.mu.Lock()
+	defer it.mu.Unlock()
+	return it.done && it.idx >= len(it.batch)
 }

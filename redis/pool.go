@@ -166,6 +166,11 @@ type Pool struct {
 	// connections from the back of the idle list when Get() is called,
 	// MaxIdleTimeout is applied to any idle connection being considered for use.
 	// If the value is zero, this check is not performed.
+	//
+	// The value must be a valid time.Duration (e.g. 30*time.Second, 5*time.Minute).
+	// Values less than time.Second are treated as zero (disabled) to prevent
+	// accidental misconfiguration where a bare integer like 30 would be
+	// interpreted as 30 nanoseconds instead of the intended 30 seconds.
 	MaxIdleTimeout time.Duration
 
 	// If Wait is true and the pool is at the MaxActive limit, then Get() waits
@@ -227,12 +232,13 @@ func (p *Pool) GetContext(ctx context.Context) (Conn, error) {
 	}
 
 	// Prune stale connections at the back of the idle list.
-	if p.IdleTimeout > 0 || p.MaxIdleTimeout > 0 {
+	effectiveMaxIdle := p.effectiveMaxIdleTimeout()
+	if p.IdleTimeout > 0 || effectiveMaxIdle > 0 {
 		n := p.idle.count
 		for i := 0; i < n && p.idle.back != nil; i++ {
 			pc := p.idle.back
 			idleExpired := p.IdleTimeout > 0 && pc.t.Add(p.IdleTimeout).Before(nowFunc())
-			maxIdleExpired := p.MaxIdleTimeout > 0 && pc.t.Add(p.MaxIdleTimeout).Before(nowFunc())
+			maxIdleExpired := effectiveMaxIdle > 0 && pc.t.Add(effectiveMaxIdle).Before(nowFunc())
 			if !idleExpired && !maxIdleExpired {
 				break
 			}
@@ -249,7 +255,7 @@ func (p *Pool) GetContext(ctx context.Context) (Conn, error) {
 		pc := p.idle.front
 		p.idle.popFront()
 		p.mu.Unlock()
-		maxIdleExpired := p.MaxIdleTimeout > 0 && pc.t.Add(p.MaxIdleTimeout).Before(nowFunc())
+		maxIdleExpired := effectiveMaxIdle > 0 && pc.t.Add(effectiveMaxIdle).Before(nowFunc())
 		if !maxIdleExpired &&
 			(p.TestOnBorrow == nil || p.TestOnBorrow(pc.c, pc.t) == nil) &&
 			(p.TestOnBorrowContext == nil || p.TestOnBorrowContext(ctx, pc.c, pc.t) == nil) &&
@@ -423,6 +429,13 @@ func (p *Pool) dial(ctx context.Context) (Conn, error) {
 		return p.Dial()
 	}
 	return nil, errors.New("redigo: must pass Dial or DialContext to pool")
+}
+
+func (p *Pool) effectiveMaxIdleTimeout() time.Duration {
+	if p.MaxIdleTimeout > 0 && p.MaxIdleTimeout < time.Second {
+		return 0
+	}
+	return p.MaxIdleTimeout
 }
 
 func (p *Pool) put(pc *poolConn, forceClose bool) error {
